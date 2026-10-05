@@ -354,6 +354,52 @@ describe('qqProvider', () => {
         expect(writeSessionValueMock).toHaveBeenCalledExactlyOnceWith('qq', 'cookie', 'qqmusic_session=opaque-token');
     });
 
+    it('puts safe backend failure details into the copied QQ diagnostics and clears them for a new QR', async () => {
+        requestMock.mockResolvedValueOnce({ data: { unikey: 'qr-key' } });
+        await qqProvider.auth!.getQrKey!('qq');
+        requestMock.mockResolvedValueOnce({
+            code: 800,
+            message: 'QR login failed',
+            failureStage: 'credential-validation',
+            failureReason: 'upstream-rejected',
+            upstreamCode: 50006,
+            retryAfterMs: 30000,
+            cookie: 'qqmusic_session=private-credential',
+        });
+        await qqProvider.auth!.checkQr!('qr-key');
+
+        const lines = await qqProvider.auth!.getQrLoginDiagnostics!();
+        expect(lines).toContain('qr-check: stage=credential-validation reason=upstream-rejected upstreamCode=50006 retryAfterMs=30000');
+        expect(lines.join('\n')).not.toContain('private-credential');
+        expect(lines.join('\n')).not.toContain('qr-key');
+
+        requestMock.mockResolvedValueOnce({ data: { unikey: 'new-key' } });
+        await qqProvider.auth!.getQrKey!('qq');
+        expect(await qqProvider.auth!.getQrLoginDiagnostics!()).toEqual([]);
+    });
+
+    it('rejects unrecognised diagnostic strings and still reports an older backend failure', async () => {
+        requestMock.mockResolvedValueOnce({
+            code: 800,
+            message: 'QR login failed',
+            failureStage: 'private-credential',
+            failureReason: 'qqmusic_key=private-credential',
+            retryAfterMs: 31000,
+        });
+        await qqProvider.auth!.checkQr!('qr-key');
+        const lines = await qqProvider.auth!.getQrLoginDiagnostics!();
+        expect(lines).toContain('qr-check: stage=unavailable reason=unavailable upstreamCode=unavailable retryAfterMs=31000');
+        expect(lines.join('\n')).not.toContain('private-credential');
+    });
+
+    it('keeps a safe transport category when the QR check itself throws', async () => {
+        requestMock.mockRejectedValueOnce(new OnlineProviderError('network', 'request failed with private-token', 'qq'));
+        await expect(qqProvider.auth!.checkQr!('qr-key')).rejects.toBeInstanceOf(OnlineProviderError);
+        const lines = await qqProvider.auth!.getQrLoginDiagnostics!();
+        expect(lines).toEqual(['qr-check: transport=network']);
+        expect(lines.join('\n')).not.toContain('private-token');
+    });
+
     it('cancels one QR session by key and never lets the failure reach the caller', async () => {
         requestMock.mockResolvedValueOnce({ code: 200 });
         await expect(qqProvider.auth!.cancelQr!('qr-key')).resolves.toBeUndefined();
