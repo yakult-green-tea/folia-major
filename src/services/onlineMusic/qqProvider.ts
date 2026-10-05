@@ -105,6 +105,7 @@ let ownedPlaylistRouteMissing = false;
 
 export const resetQqProviderRuntimeCache = (): void => {
     ownedPlaylistRouteMissing = false;
+    lastQrDiagnostic = null;
 };
 
 /**
@@ -464,8 +465,44 @@ const getAvailability = (): ReturnType<typeof getQqTransportAvailability> => {
 // 二维码失效时用户看到的是可重试的「已过期」，而不是一个还在轮询的死码。
 const QQ_QR_TTL_MS = 175_000;
 
+// The diagnostic report is copied into a public issue. Accept only fixed categories from the API.
+const QR_FAILURE_STAGES = new Set([
+    'qr-create', 'mqtt-listener', 'qr-poll', 'qr-event', 'credential-payload',
+    'credential-exchange', 'credential-validation', 'session-issue',
+]);
+const QR_FAILURE_REASONS = new Set([
+    'upstream-rejected', 'mqtt-websocket-error', 'mqtt-websocket-closed',
+    'mqtt-packet-timeout', 'mqtt-handshake-timeout', 'mqtt-handshake-failed',
+    'missing-credential', 'network-timeout', 'dns-error', 'connection-reset',
+    'connection-refused', 'network-error', 'login-rejected', 'user-canceled',
+    'qr-timeout', 'unexpected-error',
+]);
+const QR_TRANSPORT_CODES = new Set([
+    'auth-required', 'unsupported', 'unavailable', 'network', 'invalid-response',
+]);
+let lastQrDiagnostic: string | null = null;
+
+const safeQrCategory = (value: unknown, allowed: Set<string>): string =>
+    typeof value === 'string' && allowed.has(value) ? value : 'unavailable';
+
+const safeQrNumber = (value: unknown): string =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+        ? String(value) : 'unavailable';
+
+const recordQrTransportFailure = (step: 'qr-key' | 'qr-create' | 'qr-check', error: unknown): void => {
+    const code = error instanceof OnlineProviderError
+        ? safeQrCategory(error.code, QR_TRANSPORT_CODES) : 'unknown';
+    lastQrDiagnostic = `${step}: transport=${code}`;
+};
+
 const checkQr = async (key: string): Promise<QrLoginState> => {
-    const response = await requestQq<any>('login_qr_check', { key });
+    let response: any;
+    try {
+        response = await requestQq<any>('login_qr_check', { key });
+    } catch (error) {
+        recordQrTransportFailure('qr-check', error);
+        throw error;
+    }
     const code = Number(response?.code);
     if (code === 801) return { state: 'waiting' };
     if (code === 802) return { state: 'scanned' };
@@ -477,16 +514,20 @@ const checkQr = async (key: string): Promise<QrLoginState> => {
         return { state: 'confirmed' };
     }
     if (code === 800) {
+        const stage = safeQrCategory(response?.failureStage, QR_FAILURE_STAGES);
+        const reason = response?.message === 'QR code expired' && response?.failureReason === undefined
+            ? 'qr-expired' : safeQrCategory(response?.failureReason, QR_FAILURE_REASONS);
+        const upstreamCode = safeQrNumber(response?.upstreamCode);
+        const retryAfterMs = safeQrNumber(response?.retryAfterMs);
+        lastQrDiagnostic = `qr-check: stage=${stage} reason=${reason} upstreamCode=${upstreamCode} retryAfterMs=${retryAfterMs}`;
         // 800 also carries an upstream rejection; `upstreamCode` is the upstream safety number, left unnamed.
         if (response?.upstreamCode !== undefined || response?.retryAfterMs !== undefined) {
-            console.warn('[QQProvider] qr-check:upstream-rejected', {
-                upstreamCode: response?.upstreamCode,
-                retryAfterMs: response?.retryAfterMs,
-            });
+            console.warn('[QQProvider] qr-check:failed', lastQrDiagnostic);
             return { state: 'error', message: response?.message };
         }
         return { state: 'expired' };
     }
+    lastQrDiagnostic = `qr-check: unexpected-code=${safeQrNumber(response?.code)}`;
     return { state: 'error', message: response?.message };
 };
 
@@ -730,16 +771,30 @@ export const qqProvider: OnlineMusicProvider = {
         getQrLoginMethods,
         resolveQrLoginMethods,
         async getQrKey(methodId) {
-            const response = await requestQq<any>('login_qr_key', {
-                channel: resolveQrLoginMethodId(methodId),
-            });
-            return String(response?.data?.unikey || '');
+            lastQrDiagnostic = null;
+            try {
+                const response = await requestQq<any>('login_qr_key', {
+                    channel: resolveQrLoginMethodId(methodId),
+                });
+                return String(response?.data?.unikey || '');
+            } catch (error) {
+                recordQrTransportFailure('qr-key', error);
+                throw error;
+            }
         },
         async createQr(key) {
-            const response = await requestQq<any>('login_qr_create', { key });
-            return String(response?.data?.qrimg || '');
+            try {
+                const response = await requestQq<any>('login_qr_create', { key });
+                return String(response?.data?.qrimg || '');
+            } catch (error) {
+                recordQrTransportFailure('qr-create', error);
+                throw error;
+            }
         },
         checkQr,
+        async getQrLoginDiagnostics() {
+            return lastQrDiagnostic ? [lastQrDiagnostic] : [];
+        },
         getQrTtlMs: () => QQ_QR_TTL_MS,
         async cancelQr(key) {
             // 后端对未知 key 也回 200，所以失败只可能是网络层。调用方在关窗时 fire-and-forget，
