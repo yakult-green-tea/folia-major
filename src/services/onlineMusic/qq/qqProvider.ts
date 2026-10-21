@@ -743,8 +743,10 @@ const checkLogin = async (key: string): Promise<LoginState> => {
         // Idempotent with the transport, which already stored the opaque session string on this response.
         if (typeof response?.cookie === 'string' && response.cookie) {
             writeProviderSessionValue('qq', 'cookie', response.cookie);
+            return { state: 'confirmed' };
         }
-        return { state: 'confirmed' };
+        // 后端说确认了却没给 session：会话存不下，后面读账号也一定读不到，算一次失败的登录。
+        return { state: 'error', message: describeCheckAnswer(response), failure: qqCheckFailure(response) };
     }
     if (code === 800) {
         // 800 also carries an upstream rejection; `upstreamCode` is the upstream safety number, left unnamed.
