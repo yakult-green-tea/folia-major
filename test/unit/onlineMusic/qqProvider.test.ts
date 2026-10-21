@@ -347,6 +347,16 @@ describe('qqProvider', () => {
         expect(user.avatarUrl).not.toContain('music-file6');
     });
 
+    it('treats an 803 that carries no session as a failed sign-in', async () => {
+        // 后端说确认了却没给 session：存不下会话，后面读账号也一定读不到，不能当成登录成功。
+        requestMock.mockResolvedValueOnce({ code: 803, message: 'Authorization login successful' });
+
+        const state = await qqProvider.auth!.checkLogin!('qr-key');
+
+        expect(state.state).toBe('error');
+        expect(writeSessionValueMock).not.toHaveBeenCalled();
+    });
+
     it('maps every QR state translated by the backend', async () => {
         requestMock
             .mockResolvedValueOnce({ code: 801, message: 'Waiting for QR scan' })
